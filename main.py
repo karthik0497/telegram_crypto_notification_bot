@@ -253,9 +253,6 @@ def process_portfolio_add_step(message):
 
 
 
-import keep_alive
-
 if __name__ == "__main__":
     print("Bot is running with DB and Menu...")
-    keep_alive.keep_alive()
     bot.infinity_polling()
