@@ -1,132 +1,258 @@
-import logging,os
-import requests
-import asyncio
-from datetime import datetime, timedelta
-from telebot import TeleBot  # Ensure you're using the correct import
+import time
+import threading
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import helpers
+import db
 
-bot_token="5953937447:AAH1KCsL6BO3pc2DndLPMcl7S18gAS3b6Xw"
-bot = TeleBot(bot_token)  # Initialize the TeleBot object
+# Setup
+helpers.setup_logging()
+config = helpers.get_config()
 
-url="https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-# Setup logging
-logging.basicConfig(filename='bot_log.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+if not config['BOT_TOKEN']:
+    raise ValueError("No BOT_TOKEN found in .env file")
 
-user_data = {}
+bot = telebot.TeleBot(config['BOT_TOKEN'])
 
-def log_interaction(message):
-    user_id = message.from_user.id
-    user_input = message.text
-    user_status = user_data.get(user_id, {})
-    logging.info(f'User ID: {user_id} - Input: {user_input} - Status: {user_status}')
+# Initialize Database
+db.init_db()
 
-def get_crypto_data(crypto):
+# --- Background Task: Alert Monitor ---
+def monitor_alerts():
+    while True:
+        try:
+            alerts = db.get_alerts()
+            if not alerts:
+                time.sleep(60)
+                continue
+
+            # Check alerts
+            # Optimization: Group by symbol to fetch price once per loop? 
+            # For simplicity, doing one by one or simple cache could work.
+            # Let's do simple iterate for now given low volume expectation.
+            
+            for alert in alerts:
+                symbol = alert['symbol']
+                target = float(alert['target_price'])
+                condition = alert['condition']
+                
+                price_data = helpers.get_crypto_price(symbol, config['CMC_API_KEY'])
+                if not price_data:
+                    continue
+                
+                current_price = price_data['price']
+                triggered = False
+                
+                if condition == 'above' and current_price > target:
+                    triggered = True
+                elif condition == 'below' and current_price < target:
+                    triggered = True
+                    
+                if triggered:
+                    msg = f"🔔 **ALERT TRIGGERED** 🔔\n\n{symbol} is now ${current_price:,.2f} ({condition} ${target:,.2f})!"
+                    bot.send_message(alert['user_id'], msg)
+                    db.delete_alert(alert['id'])
+                    
+            time.sleep(60) # Check every minute
+        except Exception as e:
+            print(f"Alert Loop Error: {e}")
+            time.sleep(60)
+
+# Start Monitor Thread
+alert_thread = threading.Thread(target=monitor_alerts, daemon=True)
+alert_thread.start()
+
+# --- Menus ---
+
+def main_menu():
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🚀 Top Trending", callback_data="trending"),
+        InlineKeyboardButton("💰 Portfolio", callback_data="portfolio")
+    )
+    markup.row(
+        InlineKeyboardButton("🔔 Set Alert", callback_data="alert"),
+        InlineKeyboardButton("📋 My Alerts", callback_data="view_alerts")
+    )
+    markup.row(
+        InlineKeyboardButton("💱 Converter", callback_data="convert"),
+        InlineKeyboardButton("📰 News", callback_data="news")
+    )
+    markup.row(
+        InlineKeyboardButton("❓ Help", callback_data="help")
+    )
+    return markup
+
+# --- Handlers ---
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user = message.from_user
+    db.add_user(user.id, user.username)
+    bot.reply_to(message, f"👋 Hi {user.first_name}! I am your Crypto Assistant.\n\nSelect an option below:", reply_markup=main_menu())
+
+# --- Callback for Alert Condition ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cond_"))
+def alert_condition_callback(call):
+    # Format: cond_above_PRICE_SYMBOL
     try:
-        headers = {'X-CMC_PRO_API_KEY': "5c0c6dea-e42d-4fef-83f3-07edcdc832e1"}
-        parameters = {'symbol': crypto}
+        parts = call.data.split('_')
+        condition = parts[1]
+        price = float(parts[2])
+        symbol = parts[3]
+        
+        db.add_alert(call.message.chat.id, symbol, price, condition)
+        bot.answer_callback_query(call.id, "Alert set!")
+        bot.send_message(call.message.chat.id, f"✅ Set alert for {symbol} {condition} ${price}")
+        bot.send_message(call.message.chat.id, "What else would you like to do?", reply_markup=main_menu())
+    except Exception as e:
+        print(f"Alert Callback Error: {e}")
+        bot.answer_callback_query(call.id, "Failed to set alert.")
+        bot.send_message(call.message.chat.id, f"❌ Error setting alert: {str(e)}")
 
-        response = requests.get(url, headers=headers, params=parameters)
-        data = response.json()
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    chat_id = call.message.chat.id
+    
+    if call.data == "main_menu":
+        bot.send_message(chat_id, "Select an option below:", reply_markup=main_menu())
 
-        if response.status_code == 200:
-            crypto_info = data['data'][crypto]['quote']['USD']
-            return data['data'][crypto]['name'], crypto_info['price'], crypto_info['percent_change_24h'], crypto_info['volume_24h']
+    elif call.data == "trending":
+        bot.answer_callback_query(call.id, "Fetching trending coins...")
+        data = helpers.get_top_cryptos(config['CMC_API_KEY'])
+        msg = "🔥 **Top Trending (24h Change)**\n"
+        for coin in data:
+            msg += f"• {coin['symbol']}: ${coin['price']:.2f} ({coin['change']:.2f}%)\n"
+        bot.send_message(chat_id, msg)
+        bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
+        
+    elif call.data == "portfolio":
+        holdings = db.get_portfolio(chat_id)
+        if not holdings:
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("➕ Add Holding", callback_data="add_holding"))
+            markup.add(InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu"))
+            bot.send_message(chat_id, "You have no holdings tracked. Add one?", reply_markup=markup)
         else:
-            response.raise_for_status()
-    except Exception as e:
-        error_msg = f"Error occurred while fetching data for {crypto}: {e}"
-        logging.error(error_msg)
-        print(error_msg)
-        return None, None, None, None
+            bot.send_message(chat_id, "Calculating portfolio value... please wait.")
+            report = helpers.format_portfolio(holdings, config['CMC_API_KEY'])
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("✏️ Edit/Add", callback_data="add_holding"))
+            markup.add(InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu"))
+            bot.send_message(chat_id, report, parse_mode='Markdown', reply_markup=markup)
 
-async def send_message(crypto_name, crypto_price, crypto_percent_change_24h, crypto_volume_24h, chat_id):
+    elif call.data == "news":
+        news = helpers.fetch_news()
+        msg = "📰 **Latest Crypto News**\n\n"
+        for item in news:
+            msg += f"• [{item['title']}]({item['link']})\n"
+        bot.send_message(chat_id, msg, parse_mode='Markdown', disable_web_page_preview=True)
+        bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
+
+    elif call.data == "view_alerts":
+        alerts = db.get_user_alerts(chat_id)
+        if not alerts:
+             bot.send_message(chat_id, "🔕 You have no active alerts.")
+             bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
+        else:
+            msg = "📋 **Your Active Alerts**\n\n"
+            for alert in alerts:
+                # Add current price context maybe? Or just keep simple.
+                msg += f"• **{alert['symbol']}** {alert['condition']} ${alert['target_price']:,.2f}\n"
+            
+            # Add a button to clear all? Or specific? Keeping simple for now.
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🗑️ Clear All Alerts", callback_data="clear_alerts"))
+            bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
+
+    elif call.data == "clear_alerts":
+        # Delete logic
+        db.delete_user_alerts(chat_id)
+        bot.send_message(chat_id, "✅ All alerts cleared.")
+        bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
+
+    elif call.data == "alert":
+        msg = bot.send_message(chat_id, "Enter the symbol you want to watch (e.g. BTC):")
+        bot.register_next_step_handler(msg, process_alert_symbol_step)
+
+    elif call.data == "convert":
+        msg = bot.send_message(chat_id, "Enter amount and symbol to convert (e.g. 100 USD to BTC or 0.5 ETH to USD)\n*Currently supports Crypto -> USD value mainly*.\nEnter: `1 BTC` to see price.")
+        bot.register_next_step_handler(msg, process_convert_step)
+
+    elif call.data == "add_holding":
+        msg = bot.send_message(chat_id, "Enter symbol and amount (e.g. BTC 0.5):")
+        bot.register_next_step_handler(msg, process_portfolio_add_step)
+        
+    elif call.data == "help":
+        bot.send_message(chat_id, "Use the menu buttons to navigate. Data provided by CoinMarketCap.")
+
+# --- Step Handlers ---
+
+def process_alert_symbol_step(message):
     try:
-        message = f'{crypto_name}\nPrice: ${crypto_price}\nChange: {crypto_percent_change_24h}%\nVolume: ${crypto_volume_24h}'
-        await bot.send_message(chat_id=chat_id, text=message)
+        symbol = message.text.upper()
+        user_data = {'symbol': symbol}
+        msg = bot.reply_to(message, f"Watching {symbol}. Alert price? (e.g. 95000)")
+        bot.register_next_step_handler(msg, process_alert_price_step, user_data)
     except Exception as e:
-        error_msg = f"Error occurred while sending message for {crypto_name}: {e}"
-        logging.error(error_msg)
-        print(error_msg)
+        bot.reply_to(message, "Error. Try again.")
 
-async def track_crypto(crypto_list, chat_id, time_interval, total_duration):
-    start_time = datetime.now()
-    end_time = start_time + timedelta(seconds=total_duration)
-    tracking_active = True
+def process_alert_price_step(message, user_data):
+    try:
+        text = message.text.strip().replace(',', '.').replace('$', '')
+        price = float(text)
+        user_data['price'] = price
+        
+        # Determine condition automatically based on current price?
+        # Or ask user? User request: "Alert me if BTC drops below..."
+        # Let's ask condition.
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Above 📈", callback_data=f"cond_above_{price}_{user_data['symbol']}"))
+        keyboard.add(InlineKeyboardButton("Below 📉", callback_data=f"cond_below_{price}_{user_data['symbol']}"))
+        
+        bot.reply_to(message, f"Alert when price is Above or Below ${price}?", reply_markup=keyboard)
+    except ValueError:
+        bot.reply_to(message, "Invalid price. Please enter a number.")
 
-    while datetime.now() < end_time and tracking_active:
-        for crypto in crypto_list:
-            crypto_name, crypto_price, crypto_percent_change_24h, crypto_volume_24h = get_crypto_data(crypto)
-            if crypto_name is not None:
-                await send_message(crypto_name, crypto_price, crypto_percent_change_24h, crypto_volume_24h, chat_id)
+def process_convert_step(message):
+    try:
+        parts = message.text.strip().replace(',', '.').replace('$', '').split()
+        if len(parts) >= 2:
+            try:
+                amount = float(parts[0])
+            except ValueError:
+                # Handle case where amount might be second or attached to symbol (not perfect but robust)
+                 bot.reply_to(message, "Could not understand amount. Try format: 0.5 BTC")
+                 return
+            
+            symbol = parts[1].upper() # Assuming second part is symbol
+            # Revisit if symbols like "$BTC" are passed.
+            symbol = symbol.replace('$', '')
+            total, rate = helpers.convert_currency(amount, symbol, config['CMC_API_KEY'])
+            if total:
+                bot.reply_to(message, f"💱 {amount} {symbol} = ${total:,.2f} USD\n(Rate: ${rate:,.2f})")
+                bot.send_message(message.chat.id, "What would you like to do next?", reply_markup=main_menu())
+            else:
+                bot.reply_to(message, "Could not fetch conversion.")
+        else:
+            bot.reply_to(message, "Format invalid. Try: 0.5 BTC")
+    except Exception:
+        bot.reply_to(message, "Error converting.")
 
-        tracking_active = user_data.get(chat_id, {}).get('stopped', False) != True
-        await asyncio.sleep(time_interval)
+def process_portfolio_add_step(message):
+    try:
+        parts = message.text.strip().replace(',', '.').replace('$', '').split()
+        symbol = parts[0].upper()
+        amount = float(parts[1])
+        
+        db.update_portfolio(message.chat.id, symbol, amount)
+        bot.reply_to(message, f"✅ Updated portfolio: {amount} {symbol}")
+        bot.send_message(message.chat.id, "What would you like to do next?", reply_markup=main_menu())
+    except Exception:
+        bot.reply_to(message, "Invalid format. Use: SYMBOL AMOUNT (e.g. BTC 0.5)")
 
-def start_tracking(symbols, time_interval, chat_id, total_duration):
-    asyncio.run(track_crypto(symbols, chat_id, time_interval, total_duration))
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    log_interaction(message)
-    chat_id = message.chat.id
-    if chat_id not in user_data:
-        user_data[chat_id] = {}
-
-    if 'stopped' in user_data[chat_id]:
-        del user_data[chat_id]['stopped']
-        user_data[chat_id].clear()  # Reset user data
-        bot.send_message(chat_id, "Welcome back! Please start tracking again.")
-        return
-
-    if 'crypto_symbols' not in user_data[chat_id]:
-        bot.send_message(chat_id, "Welcome to the cryptocurrency tracking bot! Which cryptocurrencies would you like to track like btc,eth,sol,ada etc..? (Enter symbols separated by commas)")
-        return
-
-    if 'time_interval' not in user_data[chat_id]:
-        crypto_symbols = user_data[chat_id]['crypto_symbols']
-        bot.send_message(chat_id, f"Please enter the time interval (in seconds) for tracking {', '.join(crypto_symbols)}:")
-        return
-
-    if 'total_duration' not in user_data[chat_id]:
-        bot.send_message(chat_id, "Please enter the total duration (in seconds) for tracking:")
-        return
-
-    start_tracking(user_data[chat_id]['crypto_symbols'], user_data[chat_id]['time_interval'], chat_id, user_data[chat_id]['total_duration'])
-
-@bot.message_handler(func=lambda message: message.chat.id in user_data and 'crypto_symbols' not in user_data[message.chat.id])
-def get_crypto_symbols(message):
-    log_interaction(message)
-    chat_id = message.chat.id
-    crypto_symbols = message.text.upper().split(',')
-    crypto_symbols = [symbol.strip() for symbol in crypto_symbols]
-
-    user_data[chat_id]['crypto_symbols'] = crypto_symbols
-    bot.send_message(chat_id, "Please enter the time interval (in seconds) for tracking:")
-
-@bot.message_handler(func=lambda message: message.chat.id in user_data and 'crypto_symbols' in user_data[message.chat.id] and 'time_interval' not in user_data[message.chat.id])
-def get_time_interval(message):
-    log_interaction(message)
-    chat_id = message.chat.id
-    time_interval = int(message.text)
-    crypto_symbols = user_data[chat_id]['crypto_symbols']
-    user_data[chat_id]['time_interval'] = time_interval
-    bot.send_message(chat_id, f"Please enter the total duration (in seconds) for tracking:")
-
-@bot.message_handler(func=lambda message: message.chat.id in user_data and 'crypto_symbols' in user_data[message.chat.id] and 'time_interval' in user_data[message.chat.id] and 'total_duration' not in user_data[message.chat.id])
-def get_total_duration(message):
-    log_interaction(message)
-    chat_id = message.chat.id
-    total_duration = int(message.text)
-    user_data[chat_id]['total_duration'] = total_duration
-    bot.send_message(chat_id, f"Tracking {', '.join(user_data[chat_id]['crypto_symbols'])} every {user_data[chat_id]['time_interval']} seconds for a total duration of {total_duration} seconds...")
-    start_tracking(user_data[chat_id]['crypto_symbols'], user_data[chat_id]['time_interval'], chat_id, total_duration)
-
-@bot.message_handler(commands=["stop"])
-def stop_tracking(message):
-    log_interaction(message)
-    chat_id = message.chat.id
-    if chat_id in user_data:
-        user_data[chat_id]['stopped'] = True
-        bot.send_message(chat_id, "Tracking stopped.")
 
 if __name__ == "__main__":
-    bot.polling(none_stop=True)
+    print("Bot is running with DB and Menu...")
+    bot.infinity_polling()

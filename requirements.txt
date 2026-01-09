@@ -1,7 +1,6 @@
 requests==2.31.0
-python-telegram-bot==20.3
-telebot==0.0.4
-telegram 
 pyTelegramBotAPI
-
-
+python-dotenv
+psycopg2-binary
+feedparser
+schedule
