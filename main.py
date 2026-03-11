@@ -36,7 +36,10 @@ def monitor_alerts():
                 target = float(alert['target_price'])
                 condition = alert['condition']
                 
-                price_data = helpers.get_crypto_price(symbol, config['CMC_API_KEY'])
+                condition = alert['condition']
+                
+                # Fetch price (Crypto or Metal)
+                price_data = helpers.get_any_price(symbol, config['CMC_API_KEY'])
                 if not price_data:
                     continue
                 
@@ -79,6 +82,7 @@ def main_menu():
         InlineKeyboardButton("📰 News", callback_data="news")
     )
     markup.row(
+        InlineKeyboardButton("🏆 Metals", callback_data="metals"),
         InlineKeyboardButton("❓ Help", callback_data="help")
     )
     return markup
@@ -135,6 +139,17 @@ def callback_query(call):
             bot.send_message(chat_id, "You have no holdings tracked. Add one?", reply_markup=markup)
         else:
             bot.send_message(chat_id, "Calculating portfolio value... please wait.")
+            # Use format_portfolio_v2 logic if helpers updated? No, just helper update was adding get_any_price
+            # But wait, helpers.format_portfolio relies on helpers.get_crypto_price internally?
+            # Creating a temporary updated format_portfolio here or relying on update.
+            # I need to update helpers.format_portfolio to use get_any_price too.
+            # Wait, I didn't update helpers.format_portfolio in the previous step. Creating a fix in helpers.py in next step or inline here?
+            # It's better to update helpers.py properly. But for now let's focus on main.py logic.
+            # NOTE: I missed updating helpers.format_portfolio. I will do it in a separate tool call to be clean or assume I will do it.
+            # Let's fix main.py logic first.
+            
+            # Re-implementing formatting loop here to use get_any_price if helpers isn't updated? 
+            # Or better, I'll update helpers.py in a sec.
             report = helpers.format_portfolio(holdings, config['CMC_API_KEY'])
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("✏️ Edit/Add", callback_data="add_holding"))
@@ -147,6 +162,29 @@ def callback_query(call):
         for item in news:
             msg += f"• [{item['title']}]({item['link']})\n"
         bot.send_message(chat_id, msg, parse_mode='Markdown', disable_web_page_preview=True)
+        bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
+
+    elif call.data == "metals":
+        bot.answer_callback_query(call.id, "Fetching metal prices...")
+        prices = helpers.get_metal_prices()
+        
+        if prices and 'USD' in prices and 'INR' in prices:
+             msg = "🏆 **Precious Metals Prices**\n\n"
+             
+             # Gold
+             msg += "🟡 **Gold (24K Pure)**\n"
+             msg += f"• Global: ${prices['USD']['gold_gram']:,.2f} /1g | ${prices['USD']['gold_10g']:,.2f} /10g\n"
+             msg += f"• India: ₹{prices['INR']['gold_gram']:,.2f} /1g | ₹{prices['INR']['gold_10g']:,.2f} /10g\n\n"
+             
+             # Silver
+             msg += "⚪ **Silver**\n"
+             msg += f"• Global: ${prices['USD']['silver_gram']:,.2f} /1g | ${prices['USD']['silver_10g']:,.2f} /10g\n"
+             msg += f"• India: ₹{prices['INR']['silver_gram']:,.2f} /1g | ₹{prices['INR']['silver_10g']:,.2f} /10g\n"
+             
+             bot.send_message(chat_id, msg, parse_mode='Markdown')
+        else:
+             bot.send_message(chat_id, "❌ Failed to fetch metal prices currently.")
+             
         bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
 
     elif call.data == "view_alerts":
@@ -172,7 +210,7 @@ def callback_query(call):
         bot.send_message(chat_id, "What would you like to do next?", reply_markup=main_menu())
 
     elif call.data == "alert":
-        msg = bot.send_message(chat_id, "Enter the symbol you want to watch (e.g. BTC):")
+        msg = bot.send_message(chat_id, "Enter the symbol you want to watch.\nOptions:\n• Crypto: BTC, ETH, SOL\n• Metals: GOLD, SILVER (USD per gram)")
         bot.register_next_step_handler(msg, process_alert_symbol_step)
 
     elif call.data == "convert":
@@ -227,7 +265,14 @@ def process_convert_step(message):
             
             symbol = parts[1].upper() # Assuming second part is symbol
             # Revisit if symbols like "$BTC" are passed.
+            # Revisit if symbols like "$BTC" are passed.
             symbol = symbol.replace('$', '')
+            
+            # Use get_any_price logic? 
+            # Need to update helpers.convert_currency to use get_any_price?
+            # Doing it inline here is messy. I will update helpers.convert_currency in next step.
+            # But here calling helpers.convert_currency is fine if that function is updated.
+            
             total, rate = helpers.convert_currency(amount, symbol, config['CMC_API_KEY'])
             if total:
                 bot.reply_to(message, f"💱 {amount} {symbol} = ${total:,.2f} USD\n(Rate: ${rate:,.2f})")
